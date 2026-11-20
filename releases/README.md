@@ -4,6 +4,25 @@
 >
 > 历史版本：「releases/chrome-extension/」目录下按构建日期归档，文件名形如 `chrome-mcp-server-YYYYMMDD.zip`。
 
+## 🔄 发布流程（CI 自动完成）
+
+推送版本 tag 即可自动构建并发布：
+
+```bash
+git tag v1.0.1 && git push origin v1.0.1
+```
+
+`.github/workflows/release-extension.yml` 会依次：
+
+1. 安装依赖（只装 `chrome-mcp-server` 与 `chrome-mcp-shared`，跳过 `native-server` 的 postinstall）
+2. 构建 shared → 构建扩展 → `wxt zip`
+3. 质量门：校验 zip 完整性、确认打包后的注入脚本含 `findByText`
+4. 创建 GitHub Release（`v*` tag）并附加 `chrome-mcp-server-<version>-chrome.zip` 与 `chrome-mcp-server-latest.zip`
+5. 把新包写入 `releases/`（`latest/` + 按日期归档目录）并提交回 `master`
+6. 触发 `pages.yml` 刷新站点下载链接
+
+也可手工触发（Actions → **Build and Release Extension** → Run workflow），填写 `tag` 才会发布 Release，留空则只构建并上传 artifact。
+
 ## 🚀 快速安装
 
 ### 1. 下载扩展

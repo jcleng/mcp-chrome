@@ -1,0 +1,202 @@
+name: Build and Release Extension
+
+# Builds the Chrome extension (pnpm run build:extension + wxt zip) and publishes it.
+#
+# Triggers:
+#   - push a version tag (v*)      -> build, create the GitHub Release, attach the zip,
+#                                     and commit the fresh zip into releases/ so the
+#                                     Pages download link keeps working
+#   - workflow_dispatch            -> same, optionally with a tag name to publish under
+#
+# The extension needs chrome-mcp-shared built first, and app/native-server's postinstall
+# expects a dist/ that only exists after its own build, so the install is scoped to the two
+# packages this build actually needs.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v1.0.1). Empty = build and upload artifact only.'
+        required: false
+        type: string
+      prerelease:
+        description: 'Mark the release as a pre-release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write # needed to dispatch pages.yml from the release job
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      zip: ${{ steps.package.outputs.zip }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          # Only the two packages the extension build needs; app/native-server's postinstall
+          # requires a dist/ that does not exist yet and is irrelevant here.
+          pnpm install --no-frozen-lockfile --filter chrome-mcp-server... --filter chrome-mcp-shared
+
+      - name: Build shared package
+        run: pnpm --filter chrome-mcp-shared build
+
+      - name: Build extension
+        run: pnpm --filter chrome-mcp-server build
+
+      - name: Package extension
+        id: package
+        run: |
+          set -euo pipefail
+          pnpm --filter chrome-mcp-server zip
+          ZIPS=$(ls app/chrome-extension/.output/*.zip 2>/dev/null || true)
+          if [ -z "$ZIPS" ]; then
+            echo "No zip produced by wxt; check the zip step output above."
+            exit 1
+          fi
+          # wxt names the file from package.json; normalise it for the release asset.
+          SRC=$(echo "$ZIPS" | head -1)
+          NAME="chrome-mcp-server-chrome.zip"
+          cp "$SRC" "$RUNNER_TEMP/$NAME"
+          echo "zip=$RUNNER_TEMP/$NAME" >> "$GITHUB_OUTPUT"
+          ls -l "$RUNNER_TEMP/$NAME"
+          unzip -t "$RUNNER_TEMP/$NAME" > /dev/null
+          # The new tools must be in the shipped bundle, or the release is worthless.
+          unzip -p "$RUNNER_TEMP/$NAME" inject-scripts/accessibility-tree-helper.js | grep -q findByText \
+            || { echo "find_by_text missing from the packaged helper script"; exit 1; }
+
+      - name: Resolve version and tag
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./app/chrome-extension/package.json').version")
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ inputs.tag }}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "extension version: $VERSION, release tag: ${TAG:-<none>}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-extension-${{ steps.version.outputs.version }}
+          path: ${{ steps.package.outputs.zip }}
+          retention-days: 30
+
+  release:
+    needs: build
+    if: needs.build.outputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download built zip
+        uses: actions/download-artifact@v4
+        with:
+          name: chrome-extension-${{ needs.build.outputs.version }}
+          path: ${{ runner.temp }}/dist
+
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/dist"
+          STAMP=$(date -u +%Y%m%d)
+          VERSION="${{ needs.build.outputs.version }}"
+          cp chrome-mcp-server-chrome.zip "chrome-mcp-server-${VERSION}-chrome.zip"
+          cp chrome-mcp-server-chrome.zip chrome-mcp-server-latest.zip
+          echo "STAMP=$STAMP" >> "$GITHUB_ENV"
+          ls -l
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.build.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading/replacing assets."
+            gh release upload "$TAG" \
+              "$RUNNER_TEMP/dist/chrome-mcp-server-${VERSION}-chrome.zip" \
+              "$RUNNER_TEMP/dist/chrome-mcp-server-latest.zip" \
+              --clobber
+          else
+            EXTRA=""
+            # Only meaningful for workflow_dispatch; a tag push is never a pre-release here.
+            if [ "${{ inputs.prerelease }}" = "true" ]; then
+              EXTRA="--prerelease"
+            fi
+            gh release create "$TAG" \
+              "$RUNNER_TEMP/dist/chrome-mcp-server-${VERSION}-chrome.zip" \
+              "$RUNNER_TEMP/dist/chrome-mcp-server-latest.zip" \
+              --title "Chrome MCP Server ${TAG}" \
+              --generate-notes \
+              $EXTRA
+          fi
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name)  \(.size) bytes"'
+
+      - name: Refresh zips under releases/ for the Pages download
+        run: |
+          set -euo pipefail
+          mkdir -p "releases/chrome-extension/latest" "releases/chrome-extension/$STAMP"
+          cp "$RUNNER_TEMP/dist/chrome-mcp-server-latest.zip" \
+             releases/chrome-extension/latest/chrome-mcp-server-latest.zip
+          cp "$RUNNER_TEMP/dist/chrome-mcp-server-latest.zip" \
+             releases/chrome-extension/latest/chrome-mcp-server-lastest.zip
+          cp "$RUNNER_TEMP/dist/chrome-mcp-server-${VERSION}-chrome.zip" \
+             "releases/chrome-extension/$STAMP/chrome-mcp-server-$STAMP.zip"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add releases/
+          if git diff --staged --quiet; then
+            echo "releases/ already up to date."
+          else
+            git commit -m "chore: publish extension ${VERSION} build [skip ci]"
+            git push origin HEAD:master
+          fi
+
+      - name: Trigger Pages deployment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The bot's own push does not retrigger workflows; ask for the deploy directly.
+          gh workflow run pages.yml --ref master || \
+            echo "Could not dispatch pages.yml; it will publish on the next push."
