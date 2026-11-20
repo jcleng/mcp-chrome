@@ -1188,7 +1188,52 @@
       const n = nodes[i];
       if (n.nodeType === 3) s += ' ' + (n.nodeValue || '');
     }
+    // A button's label usually lives in an attribute, not in a text node:
+    // <input type=submit value="Submit">, <input placeholder="Search">.
+    const tag = String(el.tagName || '').toLowerCase();
+    if (tag === 'input') {
+      const type = String(el.getAttribute('type') || 'text').toLowerCase();
+      if (['submit', 'button', 'reset'].includes(type)) {
+        s += ' ' + (el.getAttribute('value') || '');
+      }
+      s += ' ' + (el.getAttribute('placeholder') || '');
+      s += ' ' + (el.getAttribute('aria-label') || '');
+    } else if (tag === 'img') {
+      s += ' ' + (el.getAttribute('alt') || '');
+    } else if (tag === 'select' || tag === 'textarea') {
+      s += ' ' + (el.getAttribute('aria-label') || '');
+    }
     return squeeze(s);
+  }
+
+  /**
+   * Whether a hit is a plain container rather than a meaningful element: no landmark role,
+   * no control, just markup that happens to hold the words.
+   * @param {Element} el
+   */
+  function isContainerHit(el) {
+    if (isStructural(el)) return false;
+    const tag = String(el.tagName || '').toLowerCase();
+    if (tag === 'label' || tag === 'button' || tag === 'a') return false;
+    return isTextOnlyElement(el) || inferRole(el) === 'generic';
+  }
+
+  /**
+   * Whether the hit sits inside a code sample (<pre>/<code>): documentation shows markup as
+   * text, and clicking that text is never what the caller meant.
+   * @param {Element} el
+   */
+  function isCodeSample(el) {
+    let cur = el;
+    for (let i = 0; i < 6 && cur && cur.nodeType === 1; i++) {
+      const tag = String(cur.tagName || '').toLowerCase();
+      if (tag === 'pre' || tag === 'code' || tag === 'kbd' || tag === 'samp') return true;
+      if (String(cur.getAttribute && cur.getAttribute('class') || '').includes('highlighter')) {
+        return true;
+      }
+      cur = cur.parentElement;
+    }
+    return false;
   }
 
   /** Nearest clickable element: the hit itself when it already is one. */
@@ -1353,6 +1398,12 @@
         }
       }
       if (score <= 0) return;
+      // Penalise hits that are only containers: a <div> showing "First name: Last name:"
+      // describes the form, it is not the field the caller wants to act on.
+      if (!isInteractive(el) && isContainerHit(el)) score *= 0.4;
+      // Code samples on documentation pages quote the very markup the caller searches for
+      // ("<input type="submit" value="Submit">"); they are never the element to act on.
+      if (isCodeSample(el)) score *= 0.15;
       const bucket = how === 'fuzzy' ? fuzzy : strong;
       bucket.push({ el, score, how, text: ownN || fullN });
     };
@@ -1373,7 +1424,12 @@
             if (isSearchVisible(el)) {
               // Light DOM text only. A shadow host is scored by what it shows itself, not
               // by its shadow content, or every host would duplicate its own widget's hit.
-              consider(el, ownText(el), el.textContent || '');
+              // `own` is what the element shows itself; `full` adds its subtree. For a
+              // control the label lives in an attribute, so ownText has to be part of full
+              // too, or <input value="Submit"> would look like an empty element.
+              const own = ownText(el);
+              const full = own + ' ' + (el.textContent || '');
+              consider(el, own, full);
             }
           } catch (_) {
             /* skip nodes that throw on layout access */
@@ -1399,21 +1455,27 @@
     for (const c of candidates) {
       if (picked.length >= limit) break;
       if (seenEls.has(c.el)) continue;
-      // Drop a hit that merely wraps an already-picked one with the same words.
+      // Drop a hit that wraps an already-picked one: the wrapper only repeats what the
+      // inner element already said, and the inner one is what gets acted on.
       let redundant = false;
       for (const p of picked) {
-        if (c.el.contains(p.el) && c.score <= p.score) {
+        if (c.el !== p.el && c.el.contains(p.el)) {
           redundant = true;
           break;
         }
       }
       if (redundant) continue;
-      seenEls.add(c.el);
+      // Two different hits can resolve to the same control (a label and the field it names,
+      // or a wrapper and its child): keep the best-scoring one only.
+      const target = actionTarget(c.el);
+      if (seenEls.has(target)) continue;
+      seenEls.add(target);
+      c.target = target;
       picked.push(c);
     }
 
     const matches = picked.map((c) => {
-      const target = actionTarget(c.el);
+      const target = c.target || actionTarget(c.el);
       const info = describeHit(target);
       const ref = ensureRef(target);
       let rect = { x: 0, y: 0, width: 0, height: 0 };
