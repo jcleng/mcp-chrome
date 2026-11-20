@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Chrome MCP Server — 扩展下载</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --fg: #1a1a1a;
+        --muted: #666;
+        --bg: #fff;
+        --card: #f6f7f9;
+        --border: #e3e6ea;
+        --accent: #2563eb;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --fg: #e8eaed;
+          --muted: #9aa0a6;
+          --bg: #16181d;
+          --card: #1e2128;
+          --border: #2c313a;
+          --accent: #6ea8fe;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 2.5rem 1.25rem 4rem;
+        font: 16px/1.65 system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+          'Noto Sans SC', sans-serif;
+        color: var(--fg);
+        background: var(--bg);
+      }
+      main { max-width: 46rem; margin: 0 auto; }
+      h1 { font-size: 1.75rem; margin: 0 0 0.35rem; letter-spacing: -0.01em; }
+      .sub { color: var(--muted); margin: 0 0 2rem; }
+      h2 { font-size: 1.1rem; margin: 2.25rem 0 0.75rem; }
+      .dl {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        flex-wrap: wrap;
+        padding: 1.1rem 1.25rem;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+      }
+      .dl .meta { color: var(--muted); font-size: 0.85rem; }
+      a.btn {
+        display: inline-block;
+        padding: 0.6rem 1.15rem;
+        background: var(--accent);
+        color: #fff;
+        text-decoration: none;
+        border-radius: 9px;
+        font-weight: 600;
+        white-space: nowrap;
+      }
+      a.btn:hover { filter: brightness(1.08); }
+      ol { padding-left: 1.35rem; }
+      li { margin: 0.35rem 0; }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.9em;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        padding: 0.1em 0.4em;
+      }
+      pre {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 0.9rem 1rem;
+        overflow-x: auto;
+        font-size: 0.85rem;
+        line-height: 1.5;
+      }
+      pre code { background: none; border: 0; padding: 0; }
+      .note {
+        border-left: 3px solid var(--accent);
+        padding: 0.15rem 0 0.15rem 0.9rem;
+        color: var(--muted);
+        margin: 1rem 0;
+      }
+      footer {
+        margin-top: 3rem;
+        padding-top: 1.25rem;
+        border-top: 1px solid var(--border);
+        color: var(--muted);
+        font-size: 0.85rem;
+      }
+      a { color: var(--accent); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Chrome MCP Server</h1>
+      <p class="sub">
+        把你自己日常使用的 Chrome 变成 MCP 服务器 —— 保留登录状态、扩展与配置，让任意支持 MCP
+        的客户端直接操作浏览器。
+      </p>
+
+      <div class="dl">
+        <div>
+          <strong>扩展下载（最新构建）</strong>
+          <div class="meta" id="build-meta">版本 1.0.0 · Chrome MV3</div>
+        </div>
+        <a class="btn" href="./releases/chrome-extension/latest/chrome-mcp-server-latest.zip" download>
+          下载 .zip
+        </a>
+      </div>
+
+      <h2>安装</h2>
+      <ol>
+        <li>下载并解压上面的 zip</li>
+        <li>打开 Chrome，地址栏输入 <code>chrome://extensions/</code></li>
+        <li>右上角开启「开发者模式」</li>
+        <li>点击「加载已解压的扩展程序」，选择解压后的文件夹</li>
+        <li>安装 <code>mcp-chrome-bridge</code> 并注册 Native Host（见下方）</li>
+      </ol>
+
+      <h2>连接 Native Server</h2>
+      <pre><code>npm install -g mcp-chrome-bridge
+mcp-chrome-bridge register</code></pre>
+      <p class="note">
+        扩展安装后在弹窗里填入 Native Server 端口（默认 <code>12306</code>），点击连接测试。
+      </p>
+
+      <h2>本版本要点</h2>
+      <ul>
+        <li>
+          <code>chrome_read_page</code> 改为紧凑大纲输出：每行一个元素，可交互节点带
+          <code>[ref=ref_N]</code>，静态文本合并为 <code>- text:</code>，同样页面体积下降约 80–90%
+        </li>
+        <li>
+          新增 <code>chrome_find_by_text</code>：按页面上的文字直接定位元素并返回 ref，
+          命中优先取最内层元素、再上溯到可操作控件（label → 对应 input/button），
+          支持 <code>exact</code> / <code>tag</code> / <code>maxResults</code> 与模糊兜底
+        </li>
+        <li>
+          两者返回同一套 ref，可直接传给 <code>chrome_click_element</code> /
+          <code>chrome_fill_or_select</code> / <code>chrome_computer</code>
+        </li>
+      </ul>
+
+      <h2>历史构建</h2>
+      <p>
+        按构建日期归档在 <code>releases/chrome-extension/&lt;YYYYMMDD&gt;/</code> 下，例如
+        <a href="./releases/chrome-extension/20261120/chrome-mcp-server-20261120.zip">20261120</a>。
+        完整列表见 <a href="./releases/README.md">releases/README.md</a>。
+      </p>
+
+      <footer>
+        源码：<a href="https://github.com/jcleng/mcp-chrome">jcleng/mcp-chrome</a> ·
+        上游：<a href="https://github.com/hangwin/mcp-chrome">hangwin/mcp-chrome</a>
+      </footer>
+    </main>
+  </body>
+</html>

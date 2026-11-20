@@ -13,6 +13,7 @@ export const TOOL_NAMES = {
     FILL: 'chrome_fill_or_select',
     REQUEST_ELEMENT_SELECTION: 'chrome_request_element_selection',
     GET_INTERACTIVE_ELEMENTS: 'chrome_get_interactive_elements',
+    FIND_BY_TEXT: 'chrome_find_by_text',
     NETWORK_CAPTURE: 'chrome_network_capture',
     // Legacy tool names (kept for internal use, not exposed in TOOL_SCHEMAS)
     NETWORK_CAPTURE_START: 'chrome_network_capture_start',
@@ -160,7 +161,11 @@ export const TOOL_SCHEMAS: Tool[] = [
   {
     name: TOOL_NAMES.BROWSER.READ_PAGE,
     description:
-      'Get an accessibility tree representation of visible elements on the page. Only returns elements that are visible in the viewport. Optionally filter for only interactive elements.\nTip: If the returned elements do not include the specific element you need, use the computer tool\'s screenshot (action="screenshot") to capture the element\'s on-screen coordinates, then operate by coordinates.',
+      'Get a compact accessibility outline of the page (YAML-like, one line per element) and act on it by ref.\n' +
+      'Every actionable node carries [ref=ref_N]: pass that ref to click / fill / computer instead of a selector or coordinates (refs are stable for the same element and stay valid until the page navigates).\n' +
+      'Static text is merged into "- text: ..." lines; unnamed containers are flattened, so the outline stays a fraction of the size of a raw DOM dump.\n' +
+      'Only visible elements are returned; filter="interactive" narrows it to controls and links.\n' +
+      'Tip: if the element you need is not in the outline, use the computer tool\'s screenshot (action="screenshot") and click by coordinates.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -179,6 +184,16 @@ export const TOOL_SCHEMAS: Tool[] = [
           description:
             'Focus on the subtree rooted at this element refId (e.g., "ref_12"). The refId must come from a recent chrome_read_page response in the same tab (refs may expire).',
         },
+        format: {
+          type: 'string',
+          description:
+            'Output shape. "compact" (default) returns the ref-annotated outline described above. "full" returns the legacy verbose dump with coordinates, ids and hrefs on every line (much larger; use only when you need geometry).',
+        },
+        includeRefMap: {
+          type: 'boolean',
+          description:
+            'Also return the ref table (ref -> CSS selector + bounding rect). Off by default: it roughly doubles the response size and refs already work without it.',
+        },
         tabId: {
           type: 'number',
           description: 'Target an existing tab by ID (default: active tab).',
@@ -189,6 +204,51 @@ export const TOOL_SCHEMAS: Tool[] = [
         },
       },
       required: [],
+    },
+  },
+  {
+    name: TOOL_NAMES.BROWSER.FIND_BY_TEXT,
+    description:
+      'Find elements on the page by the text they show and get their refs. Cheaper than chrome_read_page when you already know what you are looking for ("提交订单", "下一步", "登录"): it scans the visible page and returns the few best matches with role, name and [ref].\n' +
+      'Pass the returned ref to click / fill / computer. Matching prefers the innermost element that shows the text, then walks up to the nearest control you can act on, so a label next to a button still yields the button.\n' +
+      'Text matching is case- and whitespace-insensitive; when nothing matches exactly it falls back to a fuzzy score. Use exact=true to require the text as written.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: {
+          type: 'string',
+          description:
+            'Text to look for, as it appears on the page (e.g. "提交订单" or "Sign in"). Case and extra spaces are ignored.',
+        },
+        exact: {
+          type: 'boolean',
+          description:
+            'Require the text to match as written instead of also accepting partial and fuzzy matches. Default false.',
+        },
+        tag: {
+          type: 'string',
+          description:
+            'Only consider elements with this tag, e.g. "button", "a", "input", "label". Default: any element.',
+        },
+        maxResults: {
+          type: 'number',
+          description: 'Maximum number of matches to return (1-50, default 5).',
+        },
+        minScore: {
+          type: 'number',
+          description:
+            'Lowest fuzzy similarity (0-1) still accepted when no exact or partial match exists. Default 0.6.',
+        },
+        tabId: {
+          type: 'number',
+          description: 'Target an existing tab by ID (default: active tab).',
+        },
+        windowId: {
+          type: 'number',
+          description: 'Target window ID to pick active tab when tabId is omitted.',
+        },
+      },
+      required: ['text'],
     },
   },
   {

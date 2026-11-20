@@ -11,11 +11,53 @@
   const MAX_DEPTH = 30; // maximum DOM depth to traverse
   const MAX_NODES = 4000; // hard limit to avoid long blocking on huge DOMs
   const MAX_LINE_LABEL = 100; // max characters for a single label in output
+  const MAX_TEXT_LINE = 400; // max characters for one merged `- text:` line
   const REF_MAP_LIMIT = 1000; // limit size of the ref map to keep payload small
 
   // Keep a weak map from ref id to elements
   if (!window.__claudeElementMap) window.__claudeElementMap = {};
   if (!window.__claudeRefCounter) window.__claudeRefCounter = 0;
+  // Reverse index element -> ref, so looking up the ref of a node is O(1) instead of
+  // scanning the whole ref map for every single node (very slow on big pages).
+  if (!window.__claudeRefByEl) {
+    try {
+      window.__claudeRefByEl = new WeakMap();
+    } catch (_) {
+      window.__claudeRefByEl = null;
+    }
+  }
+
+  /**
+   * Ref of an element, creating one on first use. Refs stay stable for the same element
+   * across snapshots, which is what lets the agent reuse a ref it already has.
+   * @param {Element} el
+   * @returns {string}
+   */
+  function ensureRef(el) {
+    if (!window.__claudeElementMap) window.__claudeElementMap = {};
+    const cache = window.__claudeRefByEl;
+    if (cache) {
+      const known = cache.get(el);
+      if (known && window.__claudeElementMap[known]) return known;
+    }
+    let refId = null;
+    // Fall back to a scan only when a ref existed before this helper version loaded.
+    if (!cache) {
+      for (const k in window.__claudeElementMap) {
+        const w = window.__claudeElementMap[k];
+        if (w && typeof w.deref === 'function' && w.deref() === el) {
+          refId = k;
+          break;
+        }
+      }
+    }
+    if (!refId) {
+      refId = `ref_${++window.__claudeRefCounter}`;
+      window.__claudeElementMap[refId] = new WeakRef(el);
+    }
+    if (cache) cache.set(el, refId);
+    return refId;
+  }
 
   /**
    * Infer ARIA-like role from element
@@ -58,12 +100,75 @@
       aside: 'complementary',
       form: 'form',
       table: 'table',
+      thead: 'rowgroup',
+      tbody: 'rowgroup',
+      tfoot: 'rowgroup',
+      tr: 'row',
+      th: 'columnheader',
+      td: 'cell',
+      caption: 'caption',
       ul: 'list',
       ol: 'list',
       li: 'listitem',
       label: 'label',
     };
     return map[tag] || 'generic';
+  }
+
+  /**
+   * Accessible name of an element, used by the compact output. Unlike inferLabel it never
+   * falls back to a control's current value (a checkbox showing "on" is not its name) and
+   * it keeps names short.
+   * @param {Element} el
+   * @param {string} role
+   * @returns {string}
+   */
+  function compactName(el, role) {
+    const tag = String(el.tagName || '').toLowerCase();
+    const first = (v) => (v && String(v).trim() ? String(v).trim() : '');
+
+    if (tag === 'select') {
+      // The chosen option goes after the colon; the name is the field's label.
+      const aria = first(el.getAttribute('aria-label')) || first(el.getAttribute('title'));
+      if (aria) return squeeze(aria).slice(0, MAX_LINE_LABEL);
+      const id = /** @type {HTMLElement} */ (el).id;
+      if (id) {
+        const lab = document.querySelector(`label[for="${id}"]`);
+        if (lab && squeeze(lab.textContent)) return squeeze(lab.textContent).slice(0, MAX_LINE_LABEL);
+      }
+      const name = first(el.getAttribute('name'));
+      return name ? squeeze(name).slice(0, MAX_LINE_LABEL) : '';
+    }
+
+    if (tag === 'input') {
+      const type = String(el.getAttribute('type') || 'text').toLowerCase();
+      if (['checkbox', 'radio'].includes(type)) {
+        // Real name comes from a wrapping/for= label, aria-label or title.
+        const aria = first(el.getAttribute('aria-label')) || first(el.getAttribute('title'));
+        if (aria) return squeeze(aria).slice(0, MAX_LINE_LABEL);
+        const labels = /** @type {any} */ (el).labels;
+        if (labels && labels.length) return squeeze(labels[0].textContent || '').slice(0, MAX_LINE_LABEL);
+        return '';
+      }
+      if (type === 'submit' || type === 'button' || type === 'reset') {
+        return squeeze(first(el.getAttribute('value')) || first(el.getAttribute('aria-label'))).slice(
+          0,
+          MAX_LINE_LABEL,
+        );
+      }
+    }
+
+    // For roles whose name is their text, the whole subtree text is the name.
+    if (
+      ['link', 'button', 'heading', 'tab', 'menuitem', 'option', 'checkbox', 'radio', 'switch', 'clickable'].includes(
+        role,
+      )
+    ) {
+      const own = squeeze(inferLabel(el) || el.textContent);
+      return own.slice(0, MAX_LINE_LABEL);
+    }
+
+    return squeeze(inferLabel(el)).slice(0, MAX_LINE_LABEL);
   }
 
   /**
@@ -217,6 +322,12 @@
         'section',
         'article',
         'aside',
+        'table',
+        'tr',
+        'thead',
+        'tbody',
+        'ul',
+        'ol',
       ].includes(tag)
     )
       return true;
@@ -520,66 +631,55 @@
 
   /**
    * Traverse DOM and build pageContent lines; collect ref map for interactive nodes.
+   *
+   * Two output shapes are supported:
+   *  - compact (default): one short YAML-ish line per meaningful node, `[ref=ref_N]` only on
+   *    things you can act on, no coordinates and no redundant attributes. Static text is
+   *    merged into `- text:` lines and unnamed containers are flattened away. This is the
+   *    format the agent reads, so it is what keeps the response small.
+   *  - full: the previous verbose shape, kept for callers that need geometry/ids and for
+   *    the older record-replay paths that parse it.
+   *
    * @param {Element} el
    * @param {number} depth
-   * @param {{filter?: 'all'|'interactive', maxDepth?: number}} cfg
-   * @param {string[]} out
+   * @param {any} cfg
+   * @param {any} out sink created by createLineSink / collectNode
    * @param {Array<{ref:string, selector:string, rect:{x:number,y:number,width:number,height:number}}>} refMap
    */
-  function traverse(el, depth, cfg, out, refMap, state) {
+  function traverse(el, depth, cfg, out, refMap, state, indent) {
+    // `indent` is the visual depth: flattened containers don't shift their children right,
+    // so the tree stays readable instead of drifting into a staircase of spaces.
+    if (typeof indent !== 'number') indent = depth;
     const maxDepth = cfg && typeof cfg.maxDepth === 'number' ? cfg.maxDepth : MAX_DEPTH;
-    if (depth > maxDepth || !el || !el.tagName) return;
-    if (state.processed >= MAX_NODES) return;
-    if (state.visited.has(el)) return;
+    if (depth > maxDepth || !el || !el.tagName) return '';
+    if (state.processed >= MAX_NODES) return '';
+    if (state.visited.has(el)) return '';
     state.visited.add(el);
     const include = shouldInclude(el, cfg) || depth === 0;
+    let role = '';
+    let name = '';
+    let printed = false;
+    let textOnly = false;
     if (include) {
-      const role = inferRole(el);
-      let label = inferLabel(el);
-      let refId = null;
-      for (const k in window.__claudeElementMap) {
-        if (window.__claudeElementMap[k].deref && window.__claudeElementMap[k].deref() === el) {
-          refId = k;
-          break;
-        }
+      const interactive = isInteractive(el);
+      const node = cfg.compact
+        ? compactNode(el, interactive)
+        : verboseNode(el, indent, interactive);
+      role = node.role || '';
+      name = node.name || '';
+      textOnly = !!node.textOnly;
+      if (node && node.line) {
+        out.push(node.line);
+        state.included++;
+        printed = true;
       }
-      if (!refId) {
-        refId = `ref_${++window.__claudeRefCounter}`;
-        window.__claudeElementMap[refId] = new WeakRef(el);
-      }
-      const rect = /** @type {HTMLElement} */ (el).getBoundingClientRect();
-      const cx = Math.round(rect.left + rect.width / 2);
-      const cy = Math.round(rect.top + rect.height / 2);
-      let line = `${'  '.repeat(depth)}- ${role}`;
-      if (label) {
-        label = label.replace(/\s+/g, ' ').substring(0, MAX_LINE_LABEL);
-        line += ` "${label.replace(/"/g, '\\"')}"`;
-      }
-      line += ` [ref=${refId}] (x=${cx},y=${cy})`;
-      if (/** @type {HTMLElement} */ (el).id) line += ` id="${/** @type {HTMLElement} */ (el).id}"`;
-      const href = el.getAttribute('href');
-      if (href) line += ` href="${href}"`;
-      const type = el.getAttribute('type');
-      if (type) line += ` type="${type}"`;
-      const placeholder = el.getAttribute('placeholder');
-      if (placeholder) line += ` placeholder="${placeholder}"`;
-      // Surface disabled/pointer-events for better agent judgement
-      try {
-        const disabled = el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
-        if (disabled) line += ` disabled`;
-        const cs = window.getComputedStyle(/** @type {HTMLElement} */ (el));
-        if (cs && cs.pointerEvents === 'none') line += ` pe=none`;
-      } catch (_) {
-        /* ignore style issues */
-      }
-      out.push(line);
-      state.included++;
       state.processed++;
 
       // Only collect ref mapping for interactive elements to limit cost
-      if (isInteractive(el) && refMap.length < REF_MAP_LIMIT) {
+      if (interactive && node && node.ref && refMap.length < REF_MAP_LIMIT) {
+        const rect = /** @type {HTMLElement} */ (el).getBoundingClientRect();
         refMap.push({
-          ref: /** @type {string} */ (refId),
+          ref: node.ref,
           selector: generateSelector(el),
           rect: {
             x: rect.x,
@@ -590,40 +690,389 @@
         });
       }
     }
-    if (state.processed >= MAX_NODES) return;
-    // Traverse light DOM children
-    if (/** @type {HTMLElement} */ (el).children && depth < maxDepth) {
-      const children = /** @type {HTMLElement} */ (el).children;
-      for (let i = 0; i < children.length; i++) {
+    if (state.processed >= MAX_NODES) return '';
+
+    // Compact mode folds the node's own text plus the text of its inline children into a
+    // single `- text:` line, so a paragraph of twenty spans costs one line, not twenty,
+    // while real elements (links, buttons) still come out as their own lines.
+    // Roles whose name already is their text need no such line: the name is in the line above.
+    // A node that printed nothing (a flattened container) must not start its own text
+    // buffer: its children belong to the nearest ancestor that actually printed a line,
+    // so sibling words end up in one `- text:` instead of one line each.
+    // A node that printed a line, or a generic container that made it into the tree, keeps
+    // its own words in place: a paragraph's text must read before the links inside it.
+    // Only wrappers with no line at all bubble their words up, which is what turns
+    // <div class=meta><span>a</span><span>b</span></div> into a single line.
+    // A field shows its value after the colon, so it must not also dump its content as text.
+    const isField = /^(input|textarea|select)$/i.test(String(el.tagName || ''));
+    const nameIsText = cfg.compact && (NAME_FROM_TEXT.has(String(role)) || isField) && (!!name || isField);
+    const tagName = String(el.tagName || '').toLowerCase();
+    // filter=interactive asks for controls only: no prose, just the things you can act on.
+    const wantsText = cfg.filter !== 'interactive';
+    const ownsText = printed || (include && role === 'generic' && tagName !== 'label' && wantsText);
+    let textBuf = cfg.compact && ownsText && !nameIsText ? '' : null;
+    const flushText = () => {
+      if (textBuf === null) return;
+      const t = squeeze(textBuf);
+      textBuf = '';
+      if (t) out.push(`${'  '.repeat(Math.max(indent, 0))}- text: ${t.slice(0, MAX_TEXT_LINE)}`);
+    };
+
+    // Words from children that printed nothing bubble up to the first ancestor with a line.
+    let leftover = '';
+    // Walk child *nodes* (not just elements) so bare text nodes are not dropped.
+    const walkChildren = (nodes, childDepth) => {
+      for (let i = 0; i < nodes.length; i++) {
         if (state.processed >= MAX_NODES) break;
-        traverse(children[i], include ? depth + 1 : depth, cfg, out, refMap, state);
+        const child = nodes[i];
+        const kind = textKind(child);
+        // Words always go somewhere: to this node's text line, or up to the enclosing one.
+        const sink = (txt) => {
+          if (textBuf !== null) textBuf += ' ' + txt;
+          else leftover += ' ' + txt;
+        };
+        if (kind === 'text') {
+          sink(child.textContent || '');
+          continue;
+        }
+        if (kind === 'inline') {
+          sink(child.textContent || '');
+          state.processed++;
+          continue;
+        }
+        if (kind === 'break') continue;
+        if (child.nodeType === 1 && isTextOnlyElement(child)) {
+          const t = squeeze(foldedText(child));
+          if (t) sink(t);
+          state.processed++;
+          continue;
+        }
+        if (textBuf !== null) {
+          // A wrapper that printed no line and holds nothing actionable is just words:
+          // fold its text into the current line instead of opening a line per wrapper.
+          if (child.nodeType === 1 && isTextOnlyElement(child)) {
+            textBuf += ' ' + foldedText(child);
+            state.processed++;
+            continue;
+          }
+          flushText();
+        }
+        const rest = traverse(child, childDepth, cfg, out, refMap, state, childIndent);
+        if (rest) {
+          if (textBuf !== null) textBuf += ' ' + rest;
+          else leftover += ' ' + rest;
+        }
       }
+      flushText();
+    };
+
+    const childDepth = include ? depth + 1 : depth;
+    // Only an element that printed a visible line pushes its children one level right.
+    // Containers that merely hold text stay at their parent's level, so the outline does
+    // not drift into a staircase of whitespace on deeply nested markup.
+    const childIndent = printed ? indent + 1 : indent;
+
+    // Traverse light DOM children
+    if (/** @type {HTMLElement} */ (el).childNodes && depth < maxDepth) {
+      walkChildren(/** @type {HTMLElement} */ (el).childNodes || [], childDepth);
     }
     // Traverse shadow DOM roots (limited by maxDepth and MAX_NODES)
     try {
       const anyEl = /** @type {any} */ (el);
       if (anyEl && anyEl.shadowRoot && depth < maxDepth) {
-        const srChildren = anyEl.shadowRoot.children || [];
-        for (let i = 0; i < srChildren.length; i++) {
-          if (state.processed >= MAX_NODES) break;
-          traverse(srChildren[i], include ? depth + 1 : depth, cfg, out, refMap, state);
-        }
+        walkChildren(anyEl.shadowRoot.childNodes || [], childDepth);
       }
     } catch (_) {
       /* ignore shadow errors */
     }
+
+    // A node whose name already is its text has nothing left to give upward; a label's
+    // words belong to its control, not to the page text.
+    if (textBuf !== null || nameIsText || tagName === 'label') return '';
+    return leftover;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Line builders
+  // ---------------------------------------------------------------------------
+
+  const SKIP_TAGS = new Set(['script', 'style', 'meta', 'link', 'title', 'noscript', 'template', 'head', 'base']);
+
+  // Roles whose accessible name *is* the element's text, so the name in the line already
+  // says everything: no `- text:` child line is needed (that would only repeat it).
+  const NAME_FROM_TEXT = new Set([
+    'link',
+    'button',
+    'heading',
+    'tab',
+    'menuitem',
+    'option',
+    'treeitem',
+    'checkbox',
+    'radio',
+    'switch',
+    'listitem',
+    'cell',
+    'columnheader',
+    'rowheader',
+    'row',
+    'clickable',
+    'label',
+  ]);
+
+  /**
+   * A wrapper that prints no line of its own and contains nothing actionable: its text can
+   * be folded into the surrounding `- text:` line (typical for <div class=meta><span>…</span>).
+   * @param {Element} el
+   */
+  /**
+   * Text of a subtree with the elements kept apart ("作者0 2026-01-01" instead of
+   * "作者02026-01-01"), which is how the page reads on screen.
+   * @param {Element} el
+   */
+  function foldedText(el) {
+    let s = '';
+    const nodes = el.childNodes || [];
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i];
+      if (n.nodeType === 3) {
+        s += ' ' + (n.nodeValue || '');
+        continue;
+      }
+      if (n.nodeType !== 1) continue;
+      const tag = String(n.tagName || '').toLowerCase();
+      if (SKIP_TAGS.has(tag)) continue;
+      // A label's words already name its control; folding them here would repeat them.
+      if (tag === 'label') continue;
+      if (tag === 'br') {
+        s += ' ';
+        continue;
+      }
+      const inner = squeeze(foldedText(n));
+      if (inner) s += ' ' + inner + ' ';
+    }
+    return s;
+  }
+
+  /**
+   * An anonymous wrapper holding nothing but words. Its content can be folded into the
+   * surrounding `- text:` line instead of getting a line of its own. Real landmarks
+   * (nav/main/ul/form/table…) and anything interactive are excluded.
+   * @param {Element} el
+   */
+  function isTextOnlyElement(el) {
+    if (isInteractive(el) || isStructural(el)) return false;
+    if (inferRole(el) !== 'generic') return false;
+    if (!isVisible(el)) return true;
+    return !el.querySelector(
+      'a[href],button,input,select,textarea,details,summary,[role],[onclick],[tabindex],[contenteditable="true"],img,svg,iframe',
+    );
+  }
+
+  /** Collapse whitespace; keep it short enough for one line. */
+  function squeeze(s) {
+    return String(s || '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  /** Escape a name/value for the quoted position in a line. */
+  function q(s) {
+    return `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  }
+
+  /**
+   * How the compact walker should treat a child node while merging text.
+   * @returns {'text'|'inline'|'break'|'node'}
+   */
+  function textKind(node) {
+    if (!node) return 'break';
+    if (node.nodeType === 3) return 'text';
+    if (node.nodeType !== 1) return 'break';
+    const tag = String(node.tagName || '').toLowerCase();
+    if (tag === 'br') return 'break';
+    if (SKIP_TAGS.has(tag)) return 'break';
+    // Plain inline formatting is folded into the surrounding text, unless it hides
+    // something interactive (a span wrapping a link must stay a node of its own).
+    if (
+      /^(span|b|i|em|strong|small|mark|abbr|cite|q|s|u|sub|sup|time|font|bdi|bdo|dfn|kbd|samp|var|data|code|a11y-.*)$/.test(
+        tag,
+      ) &&
+      !/** @type {any} */ (node).shadowRoot
+    ) {
+      if (tag === 'a' && node.getAttribute('href')) return 'node';
+      if (
+        node.querySelector &&
+        node.querySelector(
+          'a[href],button,input,select,textarea,[role],[onclick],[tabindex],img,iframe,svg',
+        )
+      )
+        return 'node';
+      return 'inline';
+    }
+    return 'node';
+  }
+
+  /** State flags worth one short bracket in compact output. */
+  function stateFlags(el, role) {
+    const f = [];
+    try {
+      if (el.disabled || el.getAttribute('aria-disabled') === 'true') f.push('disabled');
+      const checkedRole =
+        role === 'checkbox' || role === 'radio' || role === 'switch' || role === 'option';
+      if (checkedRole) {
+        const on = el.tagName === 'INPUT' ? el.checked : el.getAttribute('aria-checked') === 'true';
+        if (on) f.push('checked');
+      }
+      const expanded = el.getAttribute('aria-expanded');
+      if (expanded) f.push(expanded === 'true' ? 'expanded' : 'collapsed');
+      if (el.getAttribute('aria-selected') === 'true') f.push('selected');
+      if (el.getAttribute('aria-pressed') === 'true') f.push('pressed');
+      if (el.required || el.getAttribute('aria-required') === 'true') f.push('required');
+      if (el.readOnly) f.push('readonly');
+      if (el.getAttribute('aria-current') && el.getAttribute('aria-current') !== 'false')
+        f.push('current');
+      if (role === 'heading') {
+        const lvl = el.getAttribute('aria-level') || String(el.tagName).slice(1);
+        if (lvl) f.push(`level=${lvl}`);
+      }
+    } catch (_) {
+      /* keep what we have */
+    }
+    return f;
+  }
+
+  /** Inputs whose current value is worth showing next to the control. */
+  function controlValue(el, role) {
+    try {
+      const tag = String(el.tagName || '').toUpperCase();
+      if (tag === 'SELECT') {
+        const sel = Array.from(el.selectedOptions || [])
+          .map((o) => squeeze(o.label || o.textContent))
+          .join(', ');
+        return sel || '(none)';
+      }
+      if (tag === 'INPUT' || tag === 'TEXTAREA') {
+        const type = String(el.getAttribute('type') || 'text').toLowerCase();
+        if (['checkbox', 'radio', 'button', 'submit', 'reset', 'image', 'file'].includes(type))
+          return '';
+        if (type === 'password') return el.value ? '••••' : '';
+        const v = squeeze(el.value);
+        return v.length > MAX_TEXT_LINE ? v.slice(0, MAX_TEXT_LINE) + '…' : v;
+      }
+      if (role === 'textbox' && el.isContentEditable) {
+        const v = squeeze(el.innerText);
+        return v.length > MAX_TEXT_LINE ? v.slice(0, MAX_TEXT_LINE) + '…' : v;
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    return '';
+  }
+
+  /**
+   * Compact line for one node: `- role "name" [ref=ref_N] [flags]` plus, for fields, `: value`.
+   * Returns null when the node carries nothing useful, so the caller can flatten it.
+   * @returns {{line: string|null, ref: string|null}}
+   */
+  function compactNode(el, interactive) {
+    const tag = String(el.tagName || '').toLowerCase();
+    if (SKIP_TAGS.has(tag)) return { line: null, ref: null, role: '', name: '' };
+    const role = inferRole(el);
+    const name = compactName(el, role);
+
+    const ref = interactive ? ensureRef(el) : null;
+    const flags = stateFlags(el, role);
+    if (ref) flags.unshift(`ref=${ref}`);
+
+    // Containers carry no role of their own: their words are collected by the text sink
+    // below (direct text + inline formatting), and the children print themselves.
+    if (role === 'generic') {
+      if (interactive) {
+        const head = `- clickable${name ? ' ' + q(name) : ''}${flags.map((f) => ` [${f}]`).join('')}`;
+        return { line: head, ref, role: 'clickable', name };
+      }
+      // `textOnly` tells the parent this node is nothing but words, so it can append them to
+      // the surrounding `- text:` line instead of giving every wrapper a line of its own.
+      const textOnly = !el.querySelector(
+        'a[href],button,input,select,textarea,details,summary,[role],[onclick],[tabindex],[contenteditable="true"],img,svg,iframe',
+      );
+      return { line: null, ref: null, role: 'generic', name: '', textOnly };
+    }
+
+    // <h3><a>Title</a></h3> and <li><a>Item</a></li>: the wrapper and the link say the same
+    // thing. Keep only the one the agent can act on.
+    if (!interactive && name && soleChildRepeatsName(el, name)) {
+      return { line: null, ref: null, role: '', name: '' };
+    }
+    // A <label> only names a control; the control already carries those words. Printing the
+    // label as well would say everything twice.
+    if (tag === 'label') {
+      return { line: null, ref: null, role: '', name: '' };
+    }
+
+    const value = interactive || tag === 'select' ? controlValue(el, role) : '';
+    let line = `- ${role}${name ? ' ' + q(name) : ''}${flags.map((f) => ` [${f}]`).join('')}`;
+    if (value && (tag === 'select' || value !== name)) line += `: ${value}`;
+    return { line, ref, role, name };
+  }
+
+  /** Whether the element's only visible child is one interactive element with the same text. */
+  function soleChildRepeatsName(el, name) {
+    const nodes = el.children || [];
+    if (nodes.length !== 1) return false;
+    const child = nodes[0];
+    if (!isInteractive(child)) return false;
+    const childText = squeeze(child.textContent).slice(0, MAX_LINE_LABEL);
+    return !!childText && childText === name;
+  }
+
+  /** The previous verbose line shape, kept for callers that ask for format=full. */
+  function verboseNode(el, depth, interactive) {
+    const role = inferRole(el);
+    let label = inferLabel(el);
+    const refId = ensureRef(el);
+    const rect = /** @type {HTMLElement} */ (el).getBoundingClientRect();
+    const cx = Math.round(rect.left + rect.width / 2);
+    const cy = Math.round(rect.top + rect.height / 2);
+    let line = `${'  '.repeat(depth)}- ${role}`;
+    if (label) {
+      label = label.replace(/\s+/g, ' ').substring(0, MAX_LINE_LABEL);
+      line += ` "${label.replace(/"/g, '\\"')}"`;
+    }
+    line += ` [ref=${refId}] (x=${cx},y=${cy})`;
+    if (/** @type {HTMLElement} */ (el).id) line += ` id="${/** @type {HTMLElement} */ (el).id}"`;
+    const href = el.getAttribute('href');
+    if (href) line += ` href="${href}"`;
+    const type = el.getAttribute('type');
+    if (type) line += ` type="${type}"`;
+    const placeholder = el.getAttribute('placeholder');
+    if (placeholder) line += ` placeholder="${placeholder}"`;
+    // Surface disabled/pointer-events for better agent judgement
+    try {
+      const disabled = el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
+      if (disabled) line += ` disabled`;
+      const cs = window.getComputedStyle(/** @type {HTMLElement} */ (el));
+      if (cs && cs.pointerEvents === 'none') line += ` pe=none`;
+    } catch (_) {
+      /* ignore style issues */
+    }
+    return { line, ref: interactive ? refId : null, role, name: label || '' };
   }
 
   /**
    * Generate tree and return
    * @param {'all'|'interactive'|null} filter
-   * @param {{maxDepth?: number, refId?: string}|undefined} options
+   * @param {{maxDepth?: number, refId?: string, compact?: boolean, includeRefMap?: boolean}|undefined} options
    */
   function __generateAccessibilityTree(filter, options) {
     try {
       const start = performance && performance.now ? performance.now() : Date.now();
       const out = [];
       const cfg = { filter: filter || undefined };
+      // Compact output is the default: it is what the agent reads, and it is several times
+      // smaller than the verbose dump while still carrying a ref for every actionable node.
+      cfg.compact = !(options && options.compact === false);
 
       // Clamp maxDepth to MAX_DEPTH to keep costs bounded
       if (options && Number.isFinite(options.maxDepth)) {
@@ -654,12 +1103,13 @@
         if (!window.__claudeElementMap[k].deref || !window.__claudeElementMap[k].deref())
           delete window.__claudeElementMap[k];
       }
-      const pageContent = out
-        .filter((line) => !/^\s*- generic \[ref=ref_\d+\]$/.test(line))
-        .join('\n');
+      const pageContent = cfg.compact
+        ? out.join('\n')
+        : out.filter((line) => !/^\s*- generic \[ref=ref_\d+\]$/.test(line)).join('\n');
       const end = performance && performance.now ? performance.now() : Date.now();
-      return {
+      const payload = {
         pageContent,
+        format: cfg.compact ? 'compact' : 'full',
         focus,
         viewport: {
           width: window.innerWidth,
@@ -671,8 +1121,12 @@
           included: state.included,
           durationMs: Math.round(end - start),
         },
-        refMap,
+        refCount: refMap.length,
       };
+      // The ref map (selector + rect per ref) roughly doubles the payload and callers
+      // almost never use it: refs are resolved on demand by click/fill. Opt in to get it.
+      if (options && options.includeRefMap === true) payload.refMap = refMap;
+      return payload;
     } catch (err) {
       throw new Error(
         'Error generating accessibility tree: ' +
@@ -683,6 +1137,315 @@
 
   // Expose API on window
   window.__generateAccessibilityTree = __generateAccessibilityTree;
+
+  // ============================================================================
+  // Find by text
+  // ============================================================================
+
+  /**
+   * Text as compared, not as displayed: lowercased with every run of whitespace removed.
+   * Pages write "我的订单" and "我的 订单" interchangeably, so spaces cannot take part in
+   * the comparison.
+   */
+  function normalizeText(s) {
+    return String(s || '')
+      .replace(/\s+/g, '')
+      .toLowerCase();
+  }
+
+  /** Dice coefficient over character bigrams: forgiving about paraphrase, cheap to compute. */
+  function diceScore(a, b) {
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    const bigrams = (s) => {
+      const arr = [];
+      for (let i = 0; i < s.length - 1; i++) arr.push(s.slice(i, i + 2));
+      return arr.length ? arr : [s];
+    };
+    const A = bigrams(a);
+    const B = bigrams(b);
+    let inter = 0;
+    const counts = new Map();
+    for (const t of A) counts.set(t, (counts.get(t) || 0) + 1);
+    for (const t of B) {
+      const c = counts.get(t) || 0;
+      if (c > 0) {
+        inter++;
+        counts.set(t, c - 1);
+      }
+    }
+    return (2 * inter) / (A.length + B.length);
+  }
+
+  /**
+   * Text the element itself shows, without what its children show. This is what makes
+   * "Submit" match the <button> and not the <div> that also wraps a hundred other words.
+   */
+  function ownText(el) {
+    let s = '';
+    const nodes = el.childNodes || [];
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i];
+      if (n.nodeType === 3) s += ' ' + (n.nodeValue || '');
+    }
+    return squeeze(s);
+  }
+
+  /** Nearest clickable element: the hit itself when it already is one. */
+  function nearestInteractive(el) {
+    let cur = el;
+    for (let depth = 0; cur && cur.nodeType === 1 && depth < 8; depth++) {
+      if (isInteractive(cur)) return cur;
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+
+  /**
+   * The element to act on for a text hit. A <label> is not clickable itself but names the
+   * field next to it, and a hit inside a button belongs to the button.
+   */
+  function actionTarget(el) {
+    const tag = String(el.tagName || '').toLowerCase();
+    if (tag === 'label') {
+      const control =
+        /** @type {any} */ (el).control ||
+        (el.getAttribute('for')
+          ? document.getElementById(String(el.getAttribute('for')))
+          : el.querySelector('input,select,textarea,button'));
+      if (control && control.nodeType === 1) return control;
+    }
+    return nearestInteractive(el) || el;
+  }
+
+  /**
+   * Visibility as the search needs it, resolved inside the element's own document so nodes
+   * that live in a frame are measured by their own window rather than the top one.
+   * @param {Element} el
+   */
+  function isSearchVisible(el) {
+    try {
+      const doc = el.ownerDocument || document;
+      const win = doc.defaultView || window;
+      const cs = win.getComputedStyle(/** @type {HTMLElement} */ (el));
+      if (!cs) return true;
+      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+      // Layout that is simply not reported (a frame before its first paint, an inert
+      // document) is not the same as a hidden element: only the style decides then.
+      // Zero-size elements are caught by the display/visibility checks above.
+      return true;
+    } catch (_) {
+      return true;
+    }
+  }
+
+  /** Short human description of a hit, modelled on a compact tree line. */
+  function describeHit(el) {
+    const role = inferRole(el);
+    const name = compactName(el, role);
+    return { role, name };
+  }
+
+  /**
+   * Every place worth searching: the page, its open shadow roots, and same-origin frames.
+   *
+   * Each entry is a { root, doc } pair. A TreeWalker started on a Document yields the
+   * document node itself, so the walk has to start at an element (or a shadow root).
+   */
+  function collectSearchRoots() {
+    const roots = [];
+    const addDoc = (doc) => {
+      if (!doc || !doc.documentElement) return;
+      if (roots.some((r) => r.root === doc.documentElement)) return;
+      roots.push({ root: doc.documentElement, doc });
+    };
+    addDoc(document);
+
+    const stack = [document.documentElement];
+    let visited = 0;
+    while (stack.length && visited < 12000) {
+      const node = /** @type {any} */ (stack.pop());
+      if (!node || node.nodeType !== 1) continue;
+      visited++;
+      try {
+        const sr = node.shadowRoot;
+        // A shadow root walks fine as a root; keep its owner doc for style lookups.
+        if (sr) roots.push({ root: sr, doc: node.ownerDocument || document });
+      } catch (_) {
+        /* closed shadow root */
+      }
+      try {
+        if (String(node.tagName || '').toLowerCase() === 'iframe') {
+          const doc = node.contentDocument;
+          if (doc && doc.documentElement) addDoc(doc);
+        }
+      } catch (_) {
+        /* cross-origin frame */
+      }
+      const children = node.children || [];
+      for (let i = 0; i < children.length; i++) stack.push(children[i]);
+    }
+    return roots;
+  }
+
+  /**
+   * Find the elements that show a given text.
+   *
+   * Matching is on each element's own text first, then on its whole subtree, and the hit is
+   * moved to the innermost element that still contains the same text, so the result is the
+   * control or label the person actually means rather than the page wrapper around it.
+   *
+   * @param {any} options
+   */
+  function __findByText(options) {
+    const opts = options || {};
+    const query = normalizeText(opts.text);
+    const limit = Math.max(1, Math.min(Number(opts.maxResults) || 5, 50));
+    const exact = opts.exact === true;
+    const limitTag = normalizeText(opts.tag).toUpperCase();
+    const minScore = Number.isFinite(Number(opts.minScore)) ? Number(opts.minScore) : 0.6;
+    if (!query) return { error: 'text is required' };
+
+    // One wrong character in a short label wipes out most bigrams, so the bar depends on
+    // how much text there is to compare: "提交定单" should still find "提交订单".
+    const fuzzyFloor = query.length <= 8 ? Math.min(minScore, 0.3) : minScore;
+
+    const strong = [];
+    const fuzzy = [];
+    let scanned = 0;
+
+    const consider = (el, own, full) => {
+      if (limitTag && String(el.tagName || '').toUpperCase() !== limitTag) return;
+      const ownN = normalizeText(own);
+      const fullN = normalizeText(full);
+      if (!fullN) return;
+
+      let score = 0;
+      let how = '';
+      if (exact) {
+        if (ownN === query) {
+          score = 1;
+          how = 'exact';
+        } else if (fullN === query) {
+          score = 0.98;
+          how = 'exact-subtree';
+        }
+      } else {
+        if (ownN === query) {
+          score = 1;
+          how = 'exact';
+        } else if (ownN.includes(query) && ownN.length <= query.length * 3 + 20) {
+          // Own text that contains the query and is not much longer: the real label.
+          score = 0.9 + 0.1 * (query.length / Math.max(ownN.length, 1));
+          how = 'contains';
+        } else if (fullN === query) {
+          score = 0.95;
+          how = 'subtree';
+        } else if (fullN.includes(query)) {
+          score = 0.8 + 0.1 * (query.length / Math.max(fullN.length, 1));
+          how = 'subtree-contains';
+        } else {
+          const dice = Math.max(diceScore(ownN, query), diceScore(fullN, query) * 0.9);
+          if (dice >= fuzzyFloor) {
+            score = dice;
+            how = 'fuzzy';
+          }
+        }
+      }
+      if (score <= 0) return;
+      const bucket = how === 'fuzzy' ? fuzzy : strong;
+      bucket.push({ el, score, how, text: ownN || fullN });
+    };
+
+    const roots = collectSearchRoots();
+    for (const entry of roots) {
+      // Frames live in another realm, so their nodes fail `instanceof Element` here; walk
+      // them through their own document to keep the check honest.
+      const ownedDoc = entry.doc || document;
+      const walker = ownedDoc.createTreeWalker(entry.root, 1 /* SHOW_ELEMENT */, null);
+      let node = walker.currentNode;
+      while (node && scanned < MAX_NODES * 2) {
+        const el = /** @type {Element} */ (node);
+        scanned++;
+        const tag = String(el.tagName || '').toLowerCase();
+        if (!SKIP_TAGS.has(tag)) {
+          try {
+            if (isSearchVisible(el)) {
+              // Light DOM text only. A shadow host is scored by what it shows itself, not
+              // by its shadow content, or every host would duplicate its own widget's hit.
+              consider(el, ownText(el), el.textContent || '');
+            }
+          } catch (_) {
+            /* skip nodes that throw on layout access */
+          }
+        }
+        node = walker.nextNode();
+      }
+    }
+
+    // Exact and partial hits are what the caller asked for; fuzzy ones are a last resort,
+    // so they never compete with a real match for the result slots. When the caller narrowed
+    // the search by tag, a loose guess of a different element is worse than no answer.
+    const candidates = strong.length ? strong : limitTag ? [] : fuzzy;
+    if (!candidates.length) {
+      return { matches: [], count: 0, query: opts.text, scanned };
+    }
+
+    // Prefer the innermost and shortest match: the ancestor of a hit that says the same is
+    // noise for the agent, which only needs the one element to act on.
+    candidates.sort((a, b) => b.score - a.score || a.text.length - b.text.length);
+    const picked = [];
+    const seenEls = new Set();
+    for (const c of candidates) {
+      if (picked.length >= limit) break;
+      if (seenEls.has(c.el)) continue;
+      // Drop a hit that merely wraps an already-picked one with the same words.
+      let redundant = false;
+      for (const p of picked) {
+        if (c.el.contains(p.el) && c.score <= p.score) {
+          redundant = true;
+          break;
+        }
+      }
+      if (redundant) continue;
+      seenEls.add(c.el);
+      picked.push(c);
+    }
+
+    const matches = picked.map((c) => {
+      const target = actionTarget(c.el);
+      const info = describeHit(target);
+      const ref = ensureRef(target);
+      let rect = { x: 0, y: 0, width: 0, height: 0 };
+      try {
+        const r = /** @type {HTMLElement} */ (target).getBoundingClientRect();
+        rect = {
+          x: Math.round(r.left),
+          y: Math.round(r.top),
+          width: Math.round(r.width),
+          height: Math.round(r.height),
+        };
+      } catch (_) {
+        /* detached or not rendered */
+      }
+      return {
+        ref,
+        role: info.role,
+        name: info.name,
+        tag: String(target.tagName || '').toLowerCase(),
+        text: squeeze(c.text).slice(0, MAX_LINE_LABEL),
+        matched: c.how,
+        score: Math.round(c.score * 100) / 100,
+        interactive: isInteractive(target),
+        rect,
+      };
+    });
+
+    return { matches, count: matches.length, query: opts.text, scanned };
+  }
+
+  // Expose API on window
+  window.__findByText = __findByText;
 
   // ============================================================================
   // Hover for Ref (DOM Fallback Support)
@@ -762,7 +1525,11 @@
   // Chrome message bridge for ping and tree generation
   chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
     try {
-      if (request && request.action === 'chrome_read_page_ping') {
+      if (
+        request &&
+        (request.action === 'chrome_read_page_ping' ||
+          request.action === 'chrome_find_by_text_ping')
+      ) {
         sendResponse({ status: 'pong' });
         return false;
       }
@@ -986,19 +1753,7 @@
             } catch {}
             let refId = null;
             try {
-              for (const k in window.__claudeElementMap) {
-                if (
-                  window.__claudeElementMap[k].deref &&
-                  window.__claudeElementMap[k].deref() === el
-                ) {
-                  refId = k;
-                  break;
-                }
-              }
-              if (!refId) {
-                refId = `ref_${++window.__claudeRefCounter}`;
-                window.__claudeElementMap[refId] = new WeakRef(el);
-              }
+              refId = ensureRef(el);
             } catch {}
             const cands = computeCandidates(el);
             cleanup();
@@ -1031,10 +1786,31 @@
           return true;
         }
       }
+      if (request && request.action === 'findByText') {
+        try {
+          const result = __findByText({
+            text: request.text,
+            exact: request.exact === true,
+            tag: request.tag,
+            maxResults: request.maxResults,
+            minScore: request.minScore,
+          });
+          if (result && result.error) {
+            sendResponse({ success: false, error: result.error });
+            return true;
+          }
+          sendResponse({ success: true, ...result });
+        } catch (e) {
+          sendResponse({ success: false, error: String(e && e.message ? e.message : e) });
+        }
+        return true;
+      }
       if (request && request.action === 'generateAccessibilityTree') {
         const result = __generateAccessibilityTree(request.filter || null, {
           maxDepth: request.depth,
           refId: request.refId,
+          compact: request.compact !== false,
+          includeRefMap: request.includeRefMap === true,
         });
         if (result && result.error) {
           sendResponse({ success: false, error: result.error });
@@ -1296,17 +2072,7 @@
             sendResponse({ success: false, error: `selector not found: ${sel}` });
             return true;
           }
-          let refId = null;
-          for (const k in window.__claudeElementMap) {
-            if (window.__claudeElementMap[k].deref && window.__claudeElementMap[k].deref() === el) {
-              refId = k;
-              break;
-            }
-          }
-          if (!refId) {
-            refId = `ref_${++window.__claudeRefCounter}`;
-            window.__claudeElementMap[refId] = new WeakRef(el);
-          }
+          const refId = ensureRef(el);
           const rect = /** @type {HTMLElement} */ (el).getBoundingClientRect();
           sendResponse({
             success: true,
@@ -1822,18 +2588,7 @@
             }
             if (!window.__claudeElementMap) window.__claudeElementMap = {};
             if (!window.__claudeRefCounter) window.__claudeRefCounter = 0;
-            let refId = null;
-            for (const k in window.__claudeElementMap) {
-              const w = window.__claudeElementMap[k];
-              if (w && typeof w.deref === 'function' && w.deref && w.deref() === el) {
-                refId = k;
-                break;
-              }
-            }
-            if (!refId) {
-              refId = `ref_${++window.__claudeRefCounter}`;
-              window.__claudeElementMap[refId] = new WeakRef(el);
-            }
+            const refId = ensureRef(el);
             const rect = el.getBoundingClientRect();
             respond({
               success: true,

@@ -18,6 +18,7 @@ export { javascriptTool } from './javascript';
 export { consoleTool } from './console';
 export { fileUploadTool } from './file-upload';
 export { readPageTool } from './read-page';
+export { findByTextTool } from './find-by-text';
 export { computerTool } from './computer';
 export { handleDialogTool } from './dialog';
 export { handleDownloadTool } from './download';

@@ -1,0 +1,65 @@
+name: Deploy GitHub Pages
+
+# Publishes pages-src/ (the landing page) plus releases/ (the built extension zips) to
+# GitHub Pages, so the download links on the landing page always point at a real file.
+#
+# The extension itself is built locally (pnpm run build:extension, then zip) and committed
+# under releases/ — see releases/README.md. This workflow only ships what is in the repo.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'pages-src/**'
+      - 'releases/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assemble site
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp -r pages-src/. _site/
+          # The zip files live at the repo root so they can also be fetched from the
+          # raw/branch URLs; the site serves them under /releases/.
+          cp -r releases _site/releases
+          # Fail loudly rather than publishing a landing page with a dead download link.
+          test -f _site/releases/chrome-extension/latest/chrome-mcp-server-latest.zip \
+            || { echo "missing chrome-mcp-server-latest.zip"; exit 1; }
+          ls -la _site
+          du -sh _site
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

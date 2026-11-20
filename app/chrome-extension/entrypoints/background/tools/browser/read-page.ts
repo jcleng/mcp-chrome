@@ -15,6 +15,8 @@ interface ReadPageParams {
   filter?: 'interactive'; // when omitted, return all visible elements
   depth?: number; // maximum DOM depth to traverse (0 = root only)
   refId?: string; // focus on subtree rooted at this refId
+  format?: 'compact' | 'full'; // output shape: compact (default) or legacy verbose dump
+  includeRefMap?: boolean; // also return the ref->selector/rect table (large; opt in)
   tabId?: number; // target existing tab id
   windowId?: number; // when no tabId, pick active tab from this window
 }
@@ -25,6 +27,9 @@ class ReadPageTool extends BaseBrowserToolExecutor {
   // Execute read page
   async execute(args: ReadPageParams): Promise<ToolResult> {
     const { filter, depth, refId } = args || {};
+
+    const format: 'compact' | 'full' = args?.format === 'full' ? 'full' : 'compact';
+    const includeRefMap = args?.includeRefMap === true;
 
     // Validate refId parameter
     const focusRefId = typeof refId === 'string' ? refId.trim() : '';
@@ -48,7 +53,7 @@ class ReadPageTool extends BaseBrowserToolExecutor {
     try {
       // Tip text returned to callers to guide next action
       const standardTips =
-        "If the specific element you need is missing from the returned data, use the 'screenshot' tool to capture the current viewport and confirm the element's on-screen coordinates. Also note: 'markedElements' are user-marked elements and have the highest priority when choosing targets.";
+        "pageContent is a compact outline: one line per element, indented by structure, with [ref=ref_N] on everything you can act on. Pass that ref to click/fill/computer instead of a selector or coordinates. Static text appears as '- text: ...'. If the element you need is missing, use the 'screenshot' tool. 'markedElements' are user-marked elements and have the highest priority when choosing targets.";
 
       const explicit = await this.tryGetTab(args?.tabId);
       const tab = explicit || (await this.getActiveTabOrThrowInWindow(args?.windowId));
@@ -75,6 +80,8 @@ class ReadPageTool extends BaseBrowserToolExecutor {
         filter: filter || null,
         depth: requestedDepth,
         refId: focusRefId || undefined,
+        compact: format === 'compact',
+        includeRefMap,
       });
 
       // Evaluate tree result and decide whether to fallback
@@ -95,7 +102,12 @@ class ReadPageTool extends BaseBrowserToolExecutor {
       const lines = pageContent
         ? pageContent.split('\n').filter((l: string) => l.trim().length > 0).length
         : 0;
-      const refCount = Array.isArray(resp?.refMap) ? resp.refMap.length : 0;
+      const refCount =
+        typeof resp?.refCount === 'number'
+          ? resp.refCount
+          : Array.isArray(resp?.refMap)
+            ? resp.refMap.length
+            : 0;
 
       // Skip sparse heuristics when user explicitly controls output
       const isSparse = !userControlled && lines < 10 && refCount < 3;
@@ -136,11 +148,13 @@ class ReadPageTool extends BaseBrowserToolExecutor {
       const basePayload: Record<string, any> = {
         success: true,
         filter: filter || 'all',
+        format: resp?.format === 'full' ? 'full' : 'compact',
         pageContent,
         tips: standardTips,
         viewport: treeOk ? resp.viewport : { width: null, height: null, dpr: null },
         stats: stats || { processed: 0, included: 0, durationMs: 0 },
         refMapCount: refCount,
+        refMap: includeRefMap && Array.isArray(resp?.refMap) ? resp.refMap : undefined,
         sparse: treeOk ? isSparse : false,
         depth: requestedDepth ?? null,
         focus: focusRefId ? { refId: focusRefId, found: treeOk } : null,

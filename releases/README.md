@@ -1,10 +1,16 @@
 # Chrome MCP Server Extension - Latest Release
 
+> 构建版本：**1.0.0**（含新增工具 `chrome_find_by_text` 与紧凑 `chrome_read_page` 输出）
+>
+> 历史版本：「releases/chrome-extension/」目录下按构建日期归档，文件名形如 `chrome-mcp-server-YYYYMMDD.zip`。
+
 ## 🚀 快速安装
 
 ### 1. 下载扩展
 
-下载 [chrome-mcp-server-latest.zip](/releases/chrome-extension/latest/chrome-mcp-server-lastest.zip)
+下载 [chrome-mcp-server-latest.zip](/releases/chrome-extension/latest/chrome-mcp-server-latest.zip)
+
+（旧链接 `/releases/chrome-extension/latest/chrome-mcp-server-lastest.zip` 仍然可用，指向同一个包。）
 
 ### 2. 安装步骤
 
