@@ -71,13 +71,14 @@ jobs:
       - name: Build shared package
         run: pnpm --filter chrome-mcp-shared build
 
-      - name: Build extension
-        run: pnpm --filter chrome-mcp-server build
-
       - name: Package extension
         id: package
         run: |
           set -euo pipefail
+          # `wxt zip` performs the production build itself, including the manifest and the
+          # inject-scripts copy. Producing the zip from a clean .output is what keeps
+          # vite-static-copy from racing with the previous build's cleanup.
+          rm -rf app/chrome-extension/.output
           pnpm --filter chrome-mcp-server zip
           ZIPS=$(ls app/chrome-extension/.output/*.zip 2>/dev/null || true)
           if [ -z "$ZIPS" ]; then
